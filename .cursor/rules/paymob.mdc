@@ -1,0 +1,18 @@
+---
+description: Paymob integration rules for GaragePay
+alwaysApply: true
+---
+
+Use the official Paymob AI Integration Skill as the authority for all Paymob work:
+https://github.com/PaymobAccept/Paymob-AI-Integration-Skill/tree/main/skills/paymob-integration
+
+Before changing payment code, read the canonical skill and relevant references. Live Paymob docs win if fields, endpoints, or SDK behavior differ.
+
+- Use the Intention API (`POST {base_url}/v1/intention/`) only. Never use the legacy auth-token/order/payment-key flow.
+- Keep the Secret Key, API Key, and HMAC Secret server-side. Only `pk_*` can reach the browser.
+- Use `Authorization: Token {secret_key}`, never `Bearer`.
+- Amounts use the smallest unit: 100 EGP = 10000 piasters.
+- Payment status is true only after the transaction webhook has passed SHA-512, exact-field-order, timing-safe HMAC verification.
+- Deduplicate callbacks on Paymob `obj.id`; use `special_reference` only to correlate the GaragePay payment.
+- Do not retry an ambiguous money-moving request. Reconcile with Transaction Inquiry first.
+- Default regional base URL: `https://accept.paymob.com`.

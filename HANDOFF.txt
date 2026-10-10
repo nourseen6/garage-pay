@@ -1,0 +1,356 @@
+# GaragePay agent handoff
+
+This file is the working context for **any later agent** touching this repo. Read it before changing payments, diagnosis, the Karim board, or the demo flow.
+
+Product: **GaragePay** — a hackathon prototype for **كريم’s garage in Shubra** (Egypt, EGP). Dual-role UI: **كريم** (mechanic desk) and **العميل** (driver). Real Paymob **sandbox** checkout. Arabic RTL.
+
+Repo root: this workspace. Frontend is Vite + React. Backend is Express. One command (`npm start`) runs UI + API + ngrok webhook tunnel.
+
+---
+
+## What this prototype is for
+
+Karim should look like he already runs a garage on the system: a **ledger of cases**, not an empty form. A judge / partner can:
+
+1. Open the desk and see mixed statuses immediately (seeded Shubra jobs).
+2. Click any case to jump into that stage (diagnosis, quote, shop, ready, collected).
+3. Optionally walk a **live** job: WhatsApp invite → client symptoms + real file uploads → DeepSeek diagnosis (with hardcoded fallback) → quote → **40% deposit on Paymob** → shop → ready → **balance on a new Paymob order**.
+
+Deposit and balance are **months apart in the story** and **must be different Paymob orders**.
+
+---
+
+## Locked rules (do not “simplify”)
+
+### Paymob
+
+Authority: official [Paymob AI Integration Skill](https://github.com/PaymobAccept/Paymob-AI-Integration-Skill/tree/main/skills/paymob-integration). Live Paymob docs win if fields/endpoints differ.
+
+| Rule | Detail |
+|---|---|
+| Create payments | `POST {base}/v1/intention/` only. **Never** the legacy auth-token / order / payment-key flow. |
+| Auth | `Authorization: Token {secret_key}` — **never** `Bearer`. |
+| Amounts | Smallest unit: **piasters**. 100 EGP = `10000`. |
+| Base URL | Default `https://accept.paymob.com` (Egypt). |
+| Secrets | Secret Key, API Key, HMAC Secret stay **server-side**. Only `pk_*` (Public Key) may reach the browser. |
+| Paid = true | Only after the **transaction webhook** passes SHA-512 HMAC (exact 20-field order, timing-safe compare). Redirect query params are UX only. |
+| Idempotency | Deduplicate on Paymob `obj.id`. Persist uniquely. |
+| Correlation | `special_reference` maps to our payment. Do **not** reuse the same merchant order id. |
+| Ambiguous retry | Do not retry a money-moving call. **Transaction Inquiry first**. |
+| Integration ID | Numeric Test Card ID in `PAYMOB_INTEGRATION_ID_CARD`. Intention **404** usually means the ID does not match this account/mode. |
+
+Workspace copies of these rules: `AGENTS.md`, `.cursor/rules/paymob.mdc`.
+
+### Diagnosis / media
+
+- DeepSeek is **text-only**. Never send photos or video to the model (token cost + product decision).
+- Show a **loading state** while DeepSeek runs. Do **not** flash hardcoded diagnoses first.
+- Hardcoded / past-case diagnoses appear **only if DeepSeek fails or returns nothing**.
+- Client uploads are real `<input type="file">` files. Karim can preview them locally. Video blob URLs are not persisted.
+
+### Credentials
+
+- `.env` is gitignored. Never commit it. Never paste secrets into README, this file, or chat logs you persist.
+- If a key was ever pasted in chat, treat it as leaked and rotate.
+
+---
+
+## How to run
+
+```bash
+# one-time
+cp .env.example .env   # fill keys
+npm install
+
+npm start              # API :3001 + Vite :5173 + ngrok
+```
+
+Printed when up:
+
+```text
+UI:      http://127.0.0.1:5173
+Webhook: https://<ngrok-host>/api/paymob/webhook
+```
+
+- `APP_URL` is set **in memory** by `scripts/start.mjs` via `POST /internal/app-url`. Do not require it in `.env` for the happy path.
+- Express is started with `tsx` **without watch**. Server file changes need a full `npm start` restart. Vite HMR covers `src/`.
+- If diagnose 404s, the API process is stale — restart `npm start`.
+- `NGROK_AUTHTOKEN` is required. Do not run a second ngrok terminal.
+
+### Fresh demo (empty payments + re-seeded ledger)
+
+1. Stop `npm start`.
+2. Wipe `server/data/store.json` (gitignored; recreate as `{ "jobs": {}, "events": {}, "references": {} }`).
+3. Start `npm start` again.
+4. Hard-refresh the UI: `http://127.0.0.1:5173/?fresh=1`
+
+`?fresh=1` clears browser `localStorage` board keys then reseeds. Bumping `BOARD_GENERATION` in `src/lib/garage-store.ts` also wipes the board on next load.
+
+### Tests
+
+```bash
+npm test        # vitest run
+npx tsc -b      # typecheck
+```
+
+---
+
+## Architecture
+
+```text
+Browser (Vite :5173)
+  src/App.tsx          dual-role UI
+  localStorage         Karim case ledger (garagepay-board)
+        |
+        | /api/*  (Vite proxy → :3001)
+        v
+Express (tsx server/index.ts :3001)
+  Intention API  →  Paymob
+  HMAC webhook   ←  Paymob  (via ngrok APP_URL)
+  /api/diagnose  →  DeepSeek (text) then fallback
+  server/data/store.json   payment jobs (gitignored)
+```
+
+Two stores on purpose:
+
+| Store | Where | What |
+|---|---|---|
+| Case board | Browser `localStorage` key `garagepay-board` | Karim’s ledger + full UI snapshot per case |
+| Payments | `server/data/store.json` | Paymob jobs, `obj.id` events, `special_reference` map |
+
+Seeded demo cases have **no** real Paymob `jobId`. Clicking pay on a seeded quote **does** create a new live sandbox Intention (new UUID). That is intended.
+
+---
+
+## File map
+
+| Path | Role |
+|---|---|
+| `scripts/start.mjs` | Orchestrator: API, ngrok, assign `APP_URL`, Vite |
+| `server/index.ts` | HTTP routes: payments, webhook, return, jobs, diagnose, health |
+| `server/store.ts` | JSON job store, unique `special_reference`, HMAC idempotency |
+| `src/App.tsx` | All screens; hydrate board; poll Paymob; diagnose loading |
+| `src/styles.css` | RTL garage UI (IBM Plex Sans Arabic + Manrope) |
+| `src/lib/paymob.ts` | Intention client, checkout URL, SHA-512 HMAC, inquiry |
+| `src/lib/payments.ts` | Browser `fetch` to `/api/payments/*` and `/api/jobs/:id` |
+| `src/lib/cases.ts` | Symptom model, `PAST_CASES`, `fallbackDiagnoses` |
+| `src/lib/deepseek.ts` | Prompt, JSON parse, `deepseek-v4-flash` then `deepseek-chat` |
+| `src/lib/garage-store.ts` | Board types, filters, persist, generation wipe |
+| `src/lib/demo-board.ts` | `DemoSnapshot`, 8 seed cases, ledger helpers |
+| `src/lib/media.ts` | Real uploads, image compress, don’t persist blob videos |
+| `src/lib/workflow.ts` | 40% deposit invoice, overage >15%, balance math |
+| `src/lib/report.ts` | Client-facing Arabic diagnosis report from a recommendation |
+| `AGENTS.md` / `.cursor/rules/paymob.mdc` | Always-on Paymob constraints |
+| `.env.example` | Env shape only |
+
+Tests sit next to code: `src/lib/*.test.ts`, `server/store.test.ts`.
+
+---
+
+## Environment (`.env`)
+
+From `.env.example`:
+
+| Variable | Notes |
+|---|---|
+| `PAYMOB_BASE_URL` | `https://accept.paymob.com` |
+| `PAYMOB_SECRET_KEY` | Server only. Intention auth. |
+| `PAYMOB_PUBLIC_KEY` | `pk_*` — only key allowed in checkout URL |
+| `PAYMOB_HMAC_SECRET` | Webhook verification |
+| `PAYMOB_API_KEY` | Inquiry fallback only |
+| `PAYMOB_INTEGRATION_ID_CARD` | Numeric Test Card integration |
+| `NGROK_AUTHTOKEN` | Required for `npm start` |
+| `PORT` | Default `3001` |
+| `FRONTEND_URL` | Default `http://127.0.0.1:5173` |
+| `DEEPSEEK_API_KEY` | Server only. Diagnose route |
+
+Optional: `GARAGEPAY_STORE_PATH` overrides `server/data/store.json`.
+
+---
+
+## HTTP API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/internal/app-url` | `npm start` sets ngrok HTTPS origin |
+| `GET` | `/api/health` | `{ ok, appUrl }` |
+| `POST` | `/api/payments/deposit` | New job + Intention. Body: `amountPiasters`, `customerName`, `phone`, `car`, optional `balancePiasters`, optional `jobId` (extras only) |
+| `POST` | `/api/payments/balance` | **New** job + Intention. Never reuse deposit merchant order id |
+| `POST` | `/api/paymob/webhook` | HMAC verify; on success+not pending, `recordSuccessfulPayment` |
+| `GET` | `/api/paymob/return` | Redirect to UI `/?paymob=return&job=&kind=` (not payment truth) |
+| `GET` | `/api/jobs/:id` | Poll status. `?inquire=1` after several polls if still pending |
+| `POST` | `/api/diagnose` | `{ answers, freeText, mileage, car }` — **no media**. `{ recommendations, source: "deepseek" \| "cases" }` |
+
+Vite proxies `/api` → `http://127.0.0.1:3001`.
+
+### Payment identity (important)
+
+Paymob rejects duplicate `merchant_order_id` / `special_reference`.
+
+- Each pay click creates a **new** GaragePay job UUID.
+- `special_reference` = `{jobId}:{kind}:{uuid}` via `makePaymentReference`.
+- Webhook looks up `store.references[merchant_order_id]`.
+- If `kind === "balance"` → job status `balance_paid` even on a fresh record.
+- Frontend polls the **new** `jobId` returned by `createPayment`, not an old one.
+
+---
+
+## UI model
+
+### Roles and stages
+
+- **كريم** `karimStage`: `desk` (ledger) · `diagnose` · `shop`
+- **العميل** `clientStage`: `intake` → `symptoms` → `media` → `quote` → `deposit` → `ready`
+
+Topbar: **كريم** always returns to the desk ledger. **العميل** switches role without resetting stage.
+
+### Board statuses (`CaseBoardStatus`)
+
+Derived in `deriveCaseStatus` (`src/lib/garage-store.ts`):
+
+| Status | Arabic | When |
+|---|---|---|
+| `waiting_client` | في انتظار العميل | Invite sent, packet not in |
+| `needs_diagnosis` | محتاج تشخيص | Client submitted, no quote yet |
+| `awaiting_deposit` | في انتظار العربون | Quote exists, deposit unpaid |
+| `in_shop` | في الكراج | Deposit paid |
+| `ready` | جاهزة للاستلام | `clientStage === "ready"` |
+| `collected` | تم التسليم | Balance paid |
+
+A draft is **not** listed until `shouldListOnBoard`: invite sent **or** submitted **or** has quote **or** deposit paid.
+
+### Ledger (Karim home)
+
+`src/lib/demo-board.ts` + desk in `src/App.tsx`.
+
+- Wider shell, status count tiles, two-column cards: name, car, job line, money, relative Arabic time, color badge.
+- Click a card → `applySnapshot` of that case (role/stage as stored).
+- **حالة جديدة** opens the WhatsApp composer (does not wipe seeds).
+- Empty board on first load / generation mismatch / `?fresh=1` → `ensureSeededBoard` writes 8 seeds.
+
+### Seeded cases (demo without starting from scratch)
+
+Times are relative to load (`hoursAgo`). Click behavior:
+
+| ID | Client | Car | Status | Opens |
+|---|---|---|---|---|
+| `seed-waiting-mona` | منى عبد الرحمن | نيسان صني 2014 | انتظار | Desk + WhatsApp composer |
+| `seed-diagnose-fouad` | فؤاد كمال | أكسنت 2015 | تشخيص | Diagnose (shows **loading**, then DeepSeek or fallback) |
+| `seed-deposit-ahmed` | أحمد السيد | إلنترا 2017 | عربون | Client quote (Paymob-capable) |
+| `seed-shop-hassan` | حسن توفيق | أوبترا 2012 | كراج | Karim shop + case file |
+| `seed-shop-nabil` | نبيل شكري | مازدا ٣ 2011 | كراج | Karim shop |
+| `seed-ready-layla` | ليلى منصور | كورولا 2014 | جاهزة | Client ready / balance |
+| `seed-collected-samir` | سمير جودة | لانسر 2009 | تم | Client ready, already paid |
+| `seed-collected-dina` | دينا هلال | أكسنت 2016 | تم | Client ready, already paid |
+
+Job lines / prices come from `PAST_CASES` where a quote exists. Waiting/diagnosis cases have no amount.
+
+To change seeds: edit `seedDemoBoard()` in `src/lib/demo-board.ts` and bump `BOARD_GENERATION` if existing browsers should reset.
+
+---
+
+## Live diagnosis flow (do not regress)
+
+1. Karim opens diagnose (`openDiagnose` or seed click on `needs_diagnosis`).
+2. UI sets `diagnosing=true`, `aiRecommendations=null` **before** first paint of the list.
+3. `POST /api/diagnose` with text only.
+4. While `diagnosing`: spinner “المساعد بيقرأ الأعراض…” — **no rec cards**.
+5. If `source === "deepseek"` and recs length > 0 → show those (`matchedSignals` includes `"DeepSeek"`).
+6. Else → hardcoded `fallbackDiagnoses` + warning “المساعد مش متاح — عرضنا التشخيصات المحفوظة.”
+7. Abort in-flight fetch on unmount / leave stage so a cancelled request cannot clear the loader.
+
+Karim can still type a custom diagnosis under the list.
+
+Confirming a rec (or custom) builds the client report (`src/lib/report.ts`) and moves the client to `quote`. Deposit is **40%** (`createTentativeInvoice`). Shop can bump total; overage **>15%** needs a warning (`needsOverageApproval`). Balance is remainder.
+
+Frontend payment poll: up to 45 attempts; after attempt 8, `inquire=1`. Paid only when job status is `deposit_paid` / `balance_paid` from the server (webhook).
+
+---
+
+## Paymob sandbox test cards
+
+Use Paymob **test** cards on Unified Checkout (not real money):
+
+- Mastercard: `5123456789012346` or `5123450000000008`
+- Visa: `4111111111111111`
+- Name: `Test Account`
+- Expiry: `01/39`
+- CVV: `123`
+
+HMAC webhook must hit the **current** ngrok URL. Each `npm start` may mint a new host — Paymob uses `notification_url` on that Intention, so new payments are fine; old Intentions still point at the old tunnel.
+
+---
+
+## HMAC (transaction callback)
+
+Exact field order concatenated as strings, SHA-512 hex, timing-safe equal. Fields in `callbackFields` in `src/lib/paymob.ts`:
+
+`amount_cents`, `created_at`, `currency`, `error_occured`, `has_parent_transaction`, `id`, `integration_id`, `is_3d_secure`, `is_auth`, `is_capture`, `is_refunded`, `is_standalone_payment`, `is_voided`, `order.id`, `owner`, `pending`, `source_data.pan`, `source_data.sub_type`, `source_data.type`, `success`.
+
+Received HMAC is query `?hmac=`. Reject unless 128 hex chars. Respond `401` on fail, `200 { received: true }` on accept. Process paid only if `success === true && pending === false`.
+
+---
+
+## DeepSeek
+
+- Endpoint: `https://api.deepseek.com/chat/completions`
+- Auth: `Bearer` (DeepSeek, **not** Paymob)
+- Models tried in order: `deepseek-v4-flash`, then `deepseek-chat`
+- `temperature: 0.95`
+- System: Egyptian garage mechanic, JSON only
+- Prices in the model JSON are **EGP**; parser converts to piasters (`typicalPriceEgp * 100`)
+
+---
+
+## Product copy / UX notes
+
+- Language: Egyptian Arabic in the UI. English is fine in code and this handoff.
+- Tone: workshop desk for Karim, not a chatbot. Ledger first.
+- Money formatting: `ar-EG` EGP via `formatMoney` in `App.tsx` (piasters / 100).
+- Rel times: `formatRelativeTime` (e.g. منذ ٣ ساعات، أمس، منذ ٤ أيام).
+
+---
+
+## Suggested work for later agents (safe vs careful)
+
+**Usually safe:** copy, CSS, ledger layout, extra seed cases, client intake UX, report wording, filters.
+
+**Careful (read Paymob skill + this file first):** anything under `src/lib/paymob.ts`, `server/index.ts` payment/webhook routes, `server/store.ts` references/`obj.id`, amount units, checkout URL construction.
+
+**Do not:**
+
+- Reintroduce legacy Paymob three-step auth.
+- Trust `?paymob=return` as paid.
+- Reuse one `special_reference` for deposit and balance.
+- Send media to `/api/diagnose` or DeepSeek.
+- Show hardcoded recs while DeepSeek is still loading.
+- Put secrets in the client bundle or git.
+
+---
+
+## Known pitfalls
+
+| Symptom | Likely cause |
+|---|---|
+| Intention 400 `merchant_order_id already exists` | Reused `special_reference` / job id across deposit and balance |
+| Intention 404 | Wrong `PAYMOB_INTEGRATION_ID_CARD` or not Test mode |
+| Paid never flips after checkout | ngrok URL stale, HMAC fail, or polling old `jobId` |
+| Diagnose 404 | Express not restarted after adding the route |
+| Hardcoded recs flash then swap | `diagnosing` false on first paint; keep loader until fetch ends |
+| Empty desk after a code pull | `BOARD_GENERATION` mismatch wiped storage; seeds should refill on hydrate — hard-refresh |
+| Video preview gone after reload | Blob URLs are not persisted (`persistableMedia`) |
+| Second `npm start` port in use | Kill previous API (`:3001`) and Vite (`:5173`) |
+
+---
+
+## Commands cheat sheet
+
+```bash
+npm start          # full sandbox stack
+npm test           # vitest
+npx tsc -b         # types
+npm run dev        # Vite only (API/webhook will not work)
+npm run dev:api    # Express only (no ngrok / APP_URL unless set)
+```
+
+Open for a clean ledger: `http://127.0.0.1:5173/?fresh=1`
